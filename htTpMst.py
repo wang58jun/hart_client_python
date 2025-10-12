@@ -3,6 +3,7 @@ HtTpMst will run the HART TP-DLL layer master state machine
 
 Created by J.W
  - Initial: 2024-Dec
+ - v0.1: 2025-April - Pass-through command support
 
 """
 
@@ -114,8 +115,7 @@ class HtTpMst:
         """
         self.xmt_pdu.clear()
         self.xmt_pdu = b'\x02'  # STX in polling address
-        b = set_master_type(poll_addr, self.master_str)
-        self.xmt_pdu += b.to_bytes(1, 'big')
+        self.xmt_pdu += set_master_type(poll_addr, self.master_str).to_bytes(1, 'big')
         self.xmt_pdu += b'\x00\x00'  # command 0, no data
 
         # Send & receive with 10 preambles
@@ -127,23 +127,44 @@ class HtTpMst:
                 return RET_OK
         return RET_ERROR
 
-    def snd_rcv_cmd(self, addr, cmd, data):
+    def snd_rcv_cmd(self, poll_addr, cmd, data):
         """
         Send a specific command, and return the response
-        :param addr: device slave address, 0 ~ 63
+        :param poll_addr: device polling address, 0 ~ 63
         :param cmd: 1 byte command number
         :param data: application layer payload, the first byte is the byte count
         :return: responded data from device, or an error information
         """
         self.xmt_pdu = b'\x82'  # STX in unique address
-        b = set_master_type(self.unique_addr[addr][0], self.master_str)
-        self.xmt_pdu += b.to_bytes(1, 'big')
-        self.xmt_pdu += self.unique_addr[addr][1:]
+        self.xmt_pdu += set_master_type(self.unique_addr[poll_addr][0], self.master_str).to_bytes(1, 'big')
+        self.xmt_pdu += self.unique_addr[poll_addr][1:]
         self.xmt_pdu += cmd.to_bytes(1, 'big')
         self.xmt_pdu += data
 
         rsp_data = bytearray(b'\x02\x84\x00')
-        if self.tp_xmt_rcv(self.preambles[addr]+1) == RET_OK:  # send and check
+        if self.tp_xmt_rcv(self.preambles[poll_addr]+1) == RET_OK:  # send and check
+            if self.rcv_pdu[6] == cmd:
+                rsp_data = self.rcv_pdu[7:-1]
+        return rsp_data
+
+    def pass_through_cmd(self, pre_len, master_str, unique_addr, cmd, data):
+        """
+        Send a pass through command with specific unique address, and return the response
+        :param pre_len: preamble length
+        :param master_str: 'S' or 'P'
+        :param unique_addr: sub-device 5 bytes unique address
+        :param cmd: 1 byte command number
+        :param data: application layer payload, the first byte is the byte count
+        :return: responded data from device, or an error information
+        """
+        self.xmt_pdu = b'\x82'  # STX in unique address
+        self.xmt_pdu += set_master_type(unique_addr[0], master_str).to_bytes(1, 'big')
+        self.xmt_pdu += unique_addr[1:]
+        self.xmt_pdu += cmd.to_bytes(1, 'big')
+        self.xmt_pdu += data
+
+        rsp_data = bytearray(b'\x02\x84\x00')
+        if self.tp_xmt_rcv(pre_len+1) == RET_OK:  # send and check
             if self.rcv_pdu[6] == cmd:
                 rsp_data = self.rcv_pdu[7:-1]
         return rsp_data
