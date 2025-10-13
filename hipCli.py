@@ -8,7 +8,6 @@ Created by J.W
 
 import sys
 import socket
-import threading
 import time
 import binascii
 import argparse
@@ -30,9 +29,6 @@ HIP_MSG_TP_PDU = 3
 HIP_MSG_DIR_PDU = 4
 HIP_MSG_ADT_LOG = 5
 
-RX_STA_NONE = 0
-RX_STA_HEADER  = 1
-RX_STA_PDU = 2
 
 def array_to_hex_str(array):
     return binascii.hexlify(array)  # , '-')
@@ -72,10 +68,7 @@ class HipCli:
         self.unique_addr = bytearray(5)
         self.xmt_pdu = bytearray(BUF_LEN)
         self.rcv_pdu = bytearray(BUF_LEN)
-        self.rx_thread = None
-        self.rx_status = None
         self.seq_num = 0000
-        self.exit_evt = threading.Event()
         self.verbose = verbose
 
     def port_open(self):
@@ -88,8 +81,12 @@ class HipCli:
         ret = RET_ERROR
         # noinspection PyBroadException
         try:
-            self.sock = socket.socket(family=socket.AF_INET, type=socket.SOCK_STREAM)
-            self.sock.connect(self.srv_addr)
+            if self.protocol == IP_PROTO[0]:
+                self.sock = socket.socket(family=socket.AF_INET, type=socket.SOCK_DGRAM)
+            else:
+                self.sock = socket.socket(family=socket.AF_INET, type=socket.SOCK_STREAM)
+                self.sock.connect(self.srv_addr)
+            self.sock.settimeout(5)  # 5s time-out in receiving
             self.local_ip = socket.gethostbyname(socket.gethostname())
             self.status = HIP_STA_SOCK_CONNECTED
             ret = RET_OK
@@ -99,31 +96,13 @@ class HipCli:
             print(f"Failed to connect {self.srv_addr}. Please check the port.")
         return ret
 
-    def start(self):  # Run the HART-IP client thread
-        """
-        Socket and session initial
-        :return:
-            RET_OK - Socket & session connected
-            RET_ERROR - Opened or connection fail
-        """
-        if self.sock is None:
-            if self.port_open() is RET_ERROR:
-                return RET_ERROR
-        if self.rx_thread is None:
-            self.rx_thread = threading.Thread(target=self._rcv_loop)  # Create Rx thread
-            self.rx_thread.start()  # Start Rx
-        time.sleep(0.5)  # Pending for Rx thread ready
-        self.xmt_pdu = b'\x01\x00\x09\x27\xC0'  # Keep alive: 10min
-        return self._hip_xmt_rcv(HIP_MSG_SES_INIT)
-
-    def close(self):
+    def port_close(self):
         self.__del__()
 
     def __del__(self):
         if self.status >= HIP_STA_SESSION_CONNECTED:
             self.xmt_pdu = b''
             self._hip_xmt_rcv(HIP_MSG_SES_CLOS)  # Close session
-        self.exit_evt.set()  # Inform the receiving thread to stop
         if self.sock is not None:
             self.sock.close()
         self.sock = None
@@ -150,57 +129,34 @@ class HipCli:
         while ret == RET_ERROR and n > 0:
             # Start to transmitting
             if self.verbose: print(f"hip-STX: {array_to_hex_str(wt_buf)}")
-            if self.sock.send(wt_buf) > 0:
+            if self.protocol == IP_PROTO[0]:
+                l = self.sock.sendto(wt_buf, self.srv_addr)
+            else:
+                l = self.sock.send(wt_buf)
+            if l > 0:
                 # Pending on receiving
-                self.rx_status = RX_STA_HEADER  # Start to receive
-                self.rcv_pdu.clear()
-                for i in range(15):  # pending for receiving
-                    time.sleep(0.1)
-                    if self.rx_status == RX_STA_NONE:
-                        # Rx finished
-                        if self.verbose: print(f"hip-ACK: {array_to_hex_str(self.rcv_pdu)}")
-                        if self.rcv_pdu[1] == 0x01 and self.rcv_pdu[2] == wt_buf[2] and self.rcv_pdu[4:6] == wt_buf[4:6]:
+                self.rcv_pdu = b''
+                try:
+                    if self.protocol == IP_PROTO[0]:
+                        ba, _ = self.sock.recvfrom(BUF_LEN)  # read data
+                    else:
+                        ba = self.sock.recv(BUF_LEN)
+                    if ba:
+                        # bytes received
+                        l = len(ba)
+                        if l >= HIP_HEADER_LEN and l >= (ba[6] * 256 + ba[7]):
+                            self.rcv_pdu = ba
+                            if self.verbose: print(f"hip-ACK: {array_to_hex_str(self.rcv_pdu)}")
+                            if self.rcv_pdu[1] == 0x01 and self.rcv_pdu[2] == wt_buf[2] and self.rcv_pdu[4:6] == wt_buf[4:6]:
                                 ret = RET_OK
                                 self.seq_num += 1
                                 if self.rcv_pdu[2] == HIP_MSG_SES_INIT: self.status = HIP_STA_SESSION_CONNECTED
                                 if self.rcv_pdu[2] == HIP_MSG_SES_CLOS: self.status = HIP_STA_SOCK_CONNECTED
-                        break
-            self.rx_status = RX_STA_NONE  # Reset Rx status
+                                break
+                except socket.timeout:
+                    print("Socket receiving timeout occurred!")
             n -= 1
         return ret
-
-    def _data_indicate(self, ba):
-        """
-        Called by the receiving thread to indicate bytes being received
-        :param ba: bytes array being received
-        :return: none
-        """
-        # bytes received
-        self.rcv_pdu += ba
-        l = len(self.rcv_pdu)
-        if l >= HIP_HEADER_LEN:
-            self.rx_thread = RX_STA_PDU
-            if l >= (self.rcv_pdu[6]*256 + self.rcv_pdu[7]):
-                self.rx_status = RX_STA_NONE
-
-    def _rcv_loop(self):
-        """
-        Socket reading loop
-        :return: none
-        """
-        print("Start HART-IP Client RCV_MSG")
-        # noinspection PyBroadException
-        try:
-            self.rx_status = RX_STA_NONE
-            while True:
-                if self.exit_evt.is_set():
-                    print("hipCli got exit event, exiting")
-                    break
-                ba = self.sock.recv(BUF_LEN)  # read data
-                if ba and self.rx_status != RX_STA_NONE:
-                    self._data_indicate(ba)
-        except ConnectionResetError:
-            print("hipCli ConnectionResetError, exiting")
 
 
     def tp_poll_device(self):
@@ -210,15 +166,17 @@ class HipCli:
             RET_OK - device was found in the specific polling address
             RET_ERROR - no device found
         """
-        self.xmt_pdu = b'\x02\x80'  # STX in polling address, primary master
-        self.xmt_pdu += b'\x00\x00'  # command 0, no data
-
-        # Send & receive in TP_DLL mode
-        if self._tp_xmt_rcv() == RET_OK:
-            if self.rcv_pdu[0] == 0x06 and (self.rcv_pdu[1] & 0x3f) == 0x00 and self.rcv_pdu[3] >= 14:
-                # Correct response with data
-                self.unique_addr = self.rcv_pdu[7:9] + self.rcv_pdu[15:18]
-                return RET_OK
+        time.sleep(0.5)  # Pending for Rx thread ready
+        self.xmt_pdu = b'\x01\x00\x09\x27\xC0'  # Keep alive: 10min
+        if self._hip_xmt_rcv(HIP_MSG_SES_INIT) == RET_OK:
+            self.xmt_pdu = b'\x02\x80'  # STX in polling address, primary master
+            self.xmt_pdu += b'\x00\x00'  # command 0, no data
+            # Send & receive in TP_DLL mode
+            if self._tp_xmt_rcv() == RET_OK:
+                if self.rcv_pdu[0] == 0x06 and (self.rcv_pdu[1] & 0x3f) == 0x00 and self.rcv_pdu[3] >= 14:
+                    # Correct response with data
+                    self.unique_addr = self.rcv_pdu[7:9] + self.rcv_pdu[15:18]
+                    return RET_OK
         return RET_ERROR
 
     def tp_snd_rcv_cmd(self, cmd, data):
@@ -272,26 +230,22 @@ class HipCli:
         self.xmt_pdu += check_byte(self.xmt_pdu)  # check byte
 
         ret = RET_ERROR
-        n = self.retry_num
-        while ret == RET_ERROR and n > 0:
-            # Start to transmitting
-            if self.verbose: print(f"tp-STX: {array_to_hex_str(self.xmt_pdu)}")
-            if self._hip_xmt_rcv(HIP_MSG_TP_PDU) is RET_OK:
-                l = self.rcv_pdu[6] * 256 + self.rcv_pdu[7]
-                if l <= len(self.rcv_pdu) and self.rcv_pdu[1] == 0x01 and self.rcv_pdu[2] == HIP_MSG_TP_PDU:
-                    # TP PDU response received
-                    self.rcv_pdu = self.rcv_pdu[8:]  # Only left the TP-DLL PDU
-                    if self.verbose: print(f"tp-ACK: {array_to_hex_str(self.rcv_pdu)}")
-                    c = check_byte(self.rcv_pdu)  # last check byte
-                    if c[0]: print("Check byte error")
+        # Start to transmitting
+        if self.verbose: print(f"tp-STX: {array_to_hex_str(self.xmt_pdu)}")
+        if self._hip_xmt_rcv(HIP_MSG_TP_PDU) is RET_OK:
+            l = self.rcv_pdu[6] * 256 + self.rcv_pdu[7]
+            if l > HIP_HEADER_LEN and self.rcv_pdu[1] == 0x01 and self.rcv_pdu[2] == HIP_MSG_TP_PDU:
+                # TP PDU response received
+                self.rcv_pdu = self.rcv_pdu[8:]  # Only left the TP-DLL PDU
+                if self.verbose: print(f"tp-ACK: {array_to_hex_str(self.rcv_pdu)}")
+                c = check_byte(self.rcv_pdu)  # last check byte
+                if c[0]: print("Check byte error")
+                else:
+                    if self.rcv_pdu[0] == 0x06: c = self.rcv_pdu[4] & 0x80  # communication byte
+                    else: c = self.rcv_pdu[8] & 0x80
+                    if c: print("Communication error")
                     else:
-                        if self.rcv_pdu[0] == 0x06: c = self.rcv_pdu[4] & 0x80  # communication byte
-                        else: c = self.rcv_pdu[8] & 0x80
-                        if c: print("Communication error")
-                        else:
-                            ret = RET_OK
-                    break
-            n -= 1
+                        ret = RET_OK
         return ret
 
 if __name__ == "__main__":
@@ -308,11 +262,9 @@ if __name__ == "__main__":
                       verbose=args.verbose)
     if hipClient.port_open() != RET_OK:
         sys.exit(-1)  # fail to open the port
-    hipClient.start()
 
     if hipClient.tp_poll_device() != RET_OK:
         print(f"Failed to poll a device at IP address {hipClient.srv_addr}.")
-        hipClient.exit_evt.set()
         sys.exit(-1)
     print(f"Found a device {array_to_hex_str(hipClient.unique_addr)} at IP address {hipClient.srv_addr}")
 
@@ -331,4 +283,4 @@ if __name__ == "__main__":
     print(f"Command {cmd_num} response: {array_to_hex_str(rcv_data)}")
 
     time.sleep(2)
-    hipClient.close()  # close
+    hipClient.port_close()  # close
