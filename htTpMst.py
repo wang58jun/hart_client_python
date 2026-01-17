@@ -127,6 +127,15 @@ class HtTpMst:
                 return RET_OK
         return RET_ERROR
 
+    def poll_test(self):
+        for i in range(256):
+            self.xmt_pdu = b'\x02'  # STX in polling address
+            self.xmt_pdu += i.to_bytes(1, 'big')
+            self.xmt_pdu += b'\x00\x00'  # command 0, no data
+            print(f"----> Polling {binascii.hexlify(i.to_bytes(1, 'big'))}...")
+            if self.tp_xmt_rcv(5) == RET_OK and self.rcv_pdu[0] == 0x06:
+                print(f"    <---- Device responded")
+
     def snd_rcv_cmd(self, poll_addr, cmd, data):
         """
         Send a specific command, and return the response
@@ -307,6 +316,8 @@ if __name__ == "__main__":
 
     while htTpMst.rx_status is None:
         time.sleep(0.1)
+
+#    htTpMst.poll_test()
 
     slave_addr = 0
     if htTpMst.poll_device(slave_addr) != RET_OK:
